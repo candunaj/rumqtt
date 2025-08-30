@@ -4,7 +4,7 @@ use crate::{MqttOptions, Outgoing};
 
 use crate::framed::AsyncReadWrite;
 use crate::mqttbytes::v4::*;
-use flume::{bounded, Receiver, Sender};
+use flume::{bounded, Receiver, Sender, TryRecvError};
 use tokio::net::{lookup_host, TcpSocket, TcpStream};
 use tokio::select;
 use tokio::time::{self, Instant, Sleep};
@@ -179,6 +179,63 @@ impl EventLoop {
                 Err(e)
             }
         }
+    }
+
+    /// Flush pending and buffered requests to the network without reading from it.
+    pub async fn flush(&mut self) -> Result<(), ConnectionError> {
+        if self.network.is_none() {
+            let (network, connack) = match time::timeout(
+                Duration::from_secs(self.network_options.connection_timeout()),
+                connect(&self.mqtt_options, self.network_options.clone()),
+            )
+            .await
+            {
+                Ok(inner) => inner?,
+                Err(_) => return Err(ConnectionError::NetworkTimeout),
+            };
+
+            if !connack.session_present {
+                self.pending.clear();
+            }
+            self.network = Some(network);
+
+            if self.keepalive_timeout.is_none() && !self.mqtt_options.keep_alive.is_zero() {
+                self.keepalive_timeout = Some(Box::pin(time::sleep(self.mqtt_options.keep_alive)));
+            }
+
+            // queue connack so next poll returns it
+            self.state
+                .events
+                .push_back(Event::Incoming(Packet::ConnAck(connack)));
+        }
+
+        let network = self.network.as_mut().unwrap();
+        let network_timeout = Duration::from_secs(self.network_options.connection_timeout());
+
+        while let Some(request) = self.pending.pop_front() {
+            if let Some(outgoing) = self.state.handle_outgoing_packet(request)? {
+                network.write(outgoing).await?;
+            }
+        }
+
+        while self.state.inflight < self.mqtt_options.inflight && self.state.collision.is_none() {
+            match self.requests_rx.try_recv() {
+                Ok(request) => {
+                    if let Some(outgoing) = self.state.handle_outgoing_packet(request)? {
+                        network.write(outgoing).await?;
+                    }
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => return Err(ConnectionError::RequestsDone),
+            }
+        }
+
+        match time::timeout(network_timeout, network.flush()).await {
+            Ok(inner) => inner?,
+            Err(_) => return Err(ConnectionError::FlushTimeout),
+        };
+
+        Ok(())
     }
 
     /// Select on network and requests and generate keepalive pings when necessary

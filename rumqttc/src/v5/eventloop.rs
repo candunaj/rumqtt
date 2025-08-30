@@ -4,7 +4,7 @@ use super::{Incoming, MqttOptions, MqttState, Outgoing, Request, StateError, Tra
 use crate::eventloop::socket_connect;
 use crate::framed::AsyncReadWrite;
 
-use flume::{bounded, Receiver, Sender};
+use flume::{bounded, Receiver, Sender, TryRecvError};
 use tokio::select;
 use tokio::time::{self, error::Elapsed, Instant, Sleep};
 
@@ -172,6 +172,54 @@ impl EventLoop {
                 Err(e)
             }
         }
+    }
+
+    /// Flush pending and buffered requests to the network without receiving packets.
+    pub async fn flush(&mut self) -> Result<(), ConnectionError> {
+        if self.network.is_none() {
+            let (network, connack) = time::timeout(
+                Duration::from_secs(self.options.connection_timeout()),
+                connect(&mut self.options),
+            )
+            .await??;
+
+            if !connack.session_present {
+                self.pending.clear();
+            }
+            self.network = Some(network);
+
+            if self.keepalive_timeout.is_none() {
+                self.keepalive_timeout = Some(Box::pin(time::sleep(self.options.keep_alive)));
+            }
+
+            self.state
+                .handle_incoming_packet(Incoming::ConnAck(connack))?;
+        }
+
+        let network = self.network.as_mut().unwrap();
+
+        while let Some(request) = self.pending.pop_front() {
+            if let Some(outgoing) = self.state.handle_outgoing_packet(request)? {
+                network.write(outgoing).await?;
+            }
+        }
+
+        while self.state.inflight < self.state.max_outgoing_inflight
+            && self.state.collision.is_none()
+        {
+            match self.requests_rx.try_recv() {
+                Ok(request) => {
+                    if let Some(outgoing) = self.state.handle_outgoing_packet(request)? {
+                        network.write(outgoing).await?;
+                    }
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => return Err(ConnectionError::RequestsDone),
+            }
+        }
+
+        network.flush().await?;
+        Ok(())
     }
 
     /// Select on network and requests and generate keepalive pings when necessary
